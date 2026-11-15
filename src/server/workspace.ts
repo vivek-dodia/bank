@@ -11,8 +11,10 @@ import {
   type EntryKind,
   type History,
   type Me,
+  type Responses,
 } from "../shared/types"
 import type { Env } from "./env"
+import { advance, validZone, worked } from "./hours"
 import { slack, SlackError } from "./slack"
 
 export type Install = {
@@ -96,6 +98,30 @@ type ReactionEvent = {
   item: { type: string; channel?: string; ts?: string }
 }
 
+type MessageEvent = {
+  type: "message"
+  subtype?: string
+  user?: string
+  bot_id?: string
+  text?: string
+  ts: string
+  thread_ts?: string
+  channel: string
+  channel_type?: string
+}
+
+type MentionRow = {
+  id: number
+  channel: string
+  ts: string
+  root: string | null
+  user_id: string
+  by_id: string
+  at: number
+  next: number | null
+  charged: number
+}
+
 type MemberEvent = { type: "team_join" | "user_change"; user: SlackMember }
 
 /** The events the app subscribes to (see slack-manifest.json). */
@@ -104,6 +130,7 @@ export type EventEnvelope = {
   event:
     | ReactionEvent
     | MemberEvent
+    | MessageEvent
     | { type: "channel_created"; channel: { id: string } }
     | { type: "app_uninstalled" | "tokens_revoked" }
 }
@@ -132,6 +159,7 @@ function escape(text: string) {
 }
 
 const MENTION = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/
+const MINUTE = 60 * 1000
 
 export class Workspace extends DurableObject<Env> {
   private sql: SqlStorage
@@ -173,6 +201,21 @@ export class Workspace extends DurableObject<Env> {
       );
       create table if not exists admins (id text primary key, source text not null, added_by text, at integer not null);
       create table if not exists events (id text primary key, at integer not null);
+      create table if not exists mentions (
+        id integer primary key autoincrement,
+        channel text not null,
+        ts text not null,
+        root text,
+        user_id text not null,
+        by_id text not null,
+        at integer not null,
+        next integer,
+        charged integer not null default 0,
+        answered_at integer,
+        took integer,
+        unique (channel, ts, user_id)
+      );
+      create index if not exists mentions_user on mentions (user_id, channel);
     `)
     const columns = this.sql.exec<{ name: string }>("pragma table_info(accounts)").toArray()
     if (!columns.some((column) => column.name === "gone")) {
@@ -199,6 +242,7 @@ export class Workspace extends DurableObject<Env> {
     const config = { ...defaultConfig, ...this.meta<Partial<Config>>("config") }
     // Configs saved before the symbol became an emoji held a literal character.
     if (!EMOJI_NAME.test(config.symbol)) config.symbol = defaultConfig.symbol
+    config.respond = { ...defaultConfig.respond, ...config.respond }
     return config
   }
 
@@ -342,12 +386,14 @@ export class Workspace extends DurableObject<Env> {
     note?: string | null
     actor?: string | null
     link?: string | null
+    /** Lets the balance go below zero. Only penalties do. */
+    overdraft?: boolean
   }): Move {
     return this.ctx.storage.transactionSync((): Move => {
       const from = input.from ? this.row(input.from) : null
       const to = input.to ? this.row(input.to) : null
       if ((input.from && !from) || (input.to && !to)) return { ok: false, reason: "unknown", balance: 0 }
-      if (from && from.balance < input.amount) return { ok: false, reason: "insufficient", balance: from.balance }
+      if (from && !input.overdraft && from.balance < input.amount) return { ok: false, reason: "insufficient", balance: from.balance }
       if (from) this.sql.exec("update accounts set balance = balance - ? where id = ?", input.amount, from.id)
       if (to) this.sql.exec("update accounts set balance = balance + ? where id = ?", input.amount, to.id)
       if (from && to && (input.kind === "give" || input.kind === "reaction")) {
@@ -440,6 +486,16 @@ export class Workspace extends DurableObject<Env> {
         known.balance,
       )
     }
+    // Penalties can leave a balance below zero; the ledger has to end at zero too.
+    if (known.balance < 0) {
+      this.sql.exec(
+        "insert into entries (at, kind, to_id, amount, note) values (?, 'adjust', ?, ?, 'not a member of this workspace')",
+        now,
+        id,
+        -known.balance,
+      )
+    }
+    this.sql.exec("update mentions set next = null where user_id = ?", id)
     console.log("outsider removed", { user: id, balance: known.balance })
   }
 
@@ -711,9 +767,36 @@ export class Workspace extends DurableObject<Env> {
       starting: Math.max(0, Math.min(1_000_000, Math.floor(Number(input.starting) || 0))),
       emoji,
       notify: Boolean(input.notify),
+      respond: this.cleanRespond(input.respond),
     }
     this.setMeta("config", config)
+    // Turning it off stops every running clock. Tags already waiting keep the deadlines they were given.
+    if (!config.respond.enabled) this.sql.exec("update mentions set next = null where next is not null")
+    await this.arm()
     return config
+  }
+
+  private cleanRespond(input: Partial<Config["respond"]> | undefined): Config["respond"] {
+    const fallback = this.config().respond
+    const whole = (value: unknown, min: number, max: number, otherwise: number) => {
+      const number = Math.floor(Number(value))
+      return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : otherwise
+    }
+    const tz = String(input?.tz ?? fallback.tz).trim().slice(0, 64)
+    if (!validZone(tz)) throw new Error(`"${tz}" isn't a time zone, try something like America/New_York`)
+    const open = whole(input?.open, 0, 24 * 60 - 1, fallback.open)
+    const close = whole(input?.close, 1, 24 * 60, fallback.close)
+    if (close <= open) throw new Error("working hours have to end after they start")
+    const amount = whole(input?.amount, 1, 1_000, fallback.amount)
+    return {
+      enabled: Boolean(input?.enabled),
+      minutes: whole(input?.minutes, 1, 8 * 60, fallback.minutes),
+      amount,
+      cap: Math.max(amount, whole(input?.cap, 1, 100_000, fallback.cap)),
+      tz,
+      open,
+      close,
+    }
   }
 
   async adjust(viewer: Viewer, target: string, amount: number, note: string | null) {
@@ -913,6 +996,7 @@ export class Workspace extends DurableObject<Env> {
         const note = row.note ? ` · ${escape(row.note)}` : ""
         if (row.kind === "grant") return `+${amount} starting balance`
         if (row.kind === "adjust") return row.to_id === params.user_id ? `+${amount} from an admin${note}` : `-${amount} by an admin${note}`
+        if (row.kind === "penalty") return `-${amount} slow to answer <@${row.actor}>`
         if (row.kind === "refund") return row.to_id === params.user_id ? `+${amount} refunded by <@${row.from_id}>` : `-${amount} refunded to <@${row.to_id}>`
         return row.from_id === params.user_id ? `-${amount} to <@${row.to_id}>${note}` : `+${amount} from <@${row.from_id}>${note}`
       })
@@ -968,7 +1052,22 @@ export class Workspace extends DurableObject<Env> {
     const event = envelope.event
     if (event.type === "app_uninstalled" || event.type === "tokens_revoked") return this.uninstalled()
     if (!this.install()?.token) return
+    if (event.type === "message") return this.message(event)
     if (event.type === "reaction_added" || event.type === "reaction_removed") {
+      // Reacting to the message you were tagged in counts as answering it.
+      if (event.type === "reaction_added" && event.item.type === "message" && event.item.channel && event.item.ts) {
+        await this.answered(
+          this.sql
+            .exec<MentionRow>(
+              "select * from mentions where answered_at is null and user_id = ? and channel = ? and ts = ?",
+              event.user,
+              event.item.channel,
+              event.item.ts,
+            )
+            .toArray(),
+          Date.now(),
+        )
+      }
       return this.reaction(event)
     }
     if (event.type === "channel_created") {
@@ -984,6 +1083,182 @@ export class Workspace extends DurableObject<Env> {
       const config = this.config()
       this.ctx.storage.transactionSync(() => this.applyMember(event.user, config, Date.now()))
     }
+  }
+
+  // ---------- response time
+
+  /**
+   * Every message in a public channel passes through here. One from someone with tags waiting on them answers those
+   * tags; one that tags people starts their clocks. The text is only scanned for mentions and never stored.
+   */
+  private async message(event: MessageEvent) {
+    if (event.bot_id || !event.user) return
+    if (event.subtype && event.subtype !== "thread_broadcast" && event.subtype !== "file_share") return
+    const at = Math.round(Number(event.ts) * 1000) || Date.now()
+    // A reply in a thread answers tags made in that thread or on the message that started it. A message in the channel
+    // itself answers tags made in the channel itself.
+    await this.answered(
+      event.thread_ts
+        ? this.sql
+            .exec<MentionRow>(
+              "select * from mentions where answered_at is null and user_id = ?1 and channel = ?2 and (root = ?3 or ts = ?3)",
+              event.user,
+              event.channel,
+              event.thread_ts,
+            )
+            .toArray()
+        : this.sql
+            .exec<MentionRow>(
+              "select * from mentions where answered_at is null and user_id = ? and channel = ? and root is null and at < ?",
+              event.user,
+              event.channel,
+              at,
+            )
+            .toArray(),
+      at,
+    )
+    const respond = this.config().respond
+    if (!respond.enabled || event.channel_type !== "channel") return
+    const tagged = new Set<string>()
+    for (const match of (event.text ?? "").matchAll(new RegExp(MENTION, "g"))) tagged.add(match[1]!)
+    tagged.delete(event.user)
+    let started = 0
+    for (const id of [...tagged].slice(0, 20)) {
+      // Only people who already hold an account: full members of this workspace. Never bots, guests who haven't used
+      // Bank, or people from other organizations.
+      const account = this.row(id)
+      if (!account || account.bot || account.gone) continue
+      started += this.sql.exec(
+        "insert or ignore into mentions (channel, ts, root, user_id, by_id, at, next) values (?, ?, ?, ?, ?, ?, ?)",
+        event.channel,
+        event.ts,
+        event.thread_ts && event.thread_ts !== event.ts ? event.thread_ts : null,
+        id,
+        event.user,
+        at,
+        advance(at, respond.minutes * MINUTE, respond),
+      ).rowsWritten
+    }
+    if (started) await this.arm()
+  }
+
+  /** Stops the clock on tags that just got an answer and records how long the answer took, in working time. */
+  private async answered(rows: MentionRow[], at: number) {
+    if (!rows.length) return
+    const respond = this.config().respond
+    for (const row of rows) {
+      this.sql.exec(
+        "update mentions set answered_at = ?, took = ?, next = null where id = ?",
+        at,
+        worked(row.at, Math.max(at, row.at), respond),
+        row.id,
+      )
+    }
+    await this.arm()
+  }
+
+  /** Sets the alarm for the next charge that falls due, if any. */
+  private async arm() {
+    const next = this.sql.exec<{ next: number | null }>("select min(next) as next from mentions where next is not null").one().next
+    if (next === null) await this.ctx.storage.deleteAlarm()
+    else await this.ctx.storage.setAlarm(next)
+  }
+
+  private permalink(row: MentionRow) {
+    const domain = this.install()?.domain
+    if (!domain) return null
+    const thread = row.root ? `?thread_ts=${row.root}&cid=${row.channel}` : ""
+    return `https://${domain}.slack.com/archives/${row.channel}/p${row.ts.replace(".", "")}${thread}`
+  }
+
+  /** Charges everyone whose time to answer a tag has run out, then waits for the next one. */
+  override async alarm() {
+    const config = this.config()
+    const respond = config.respond
+    const now = Date.now()
+    if (!respond.enabled || !this.install()?.token) {
+      this.sql.exec("update mentions set next = null where next is not null")
+      return
+    }
+    const due = this.sql.exec<MentionRow>("select * from mentions where next is not null and next <= ?", now).toArray()
+    const warn: MentionRow[] = []
+    this.ctx.storage.transactionSync(() => {
+      for (const row of due) {
+        let next = row.next
+        let charged = row.charged
+        const account = this.row(row.user_id)
+        if (!account || account.gone) next = null
+        // An alarm that fires late charges for every wait that ran out in the meantime.
+        while (next !== null && next <= now) {
+          const amount = Math.min(respond.amount, respond.cap - charged)
+          const moved =
+            amount > 0 &&
+            this.move({
+              from: row.user_id,
+              to: null,
+              amount,
+              kind: "penalty",
+              note: "slow to answer",
+              actor: row.by_id,
+              link: this.permalink(row),
+              overdraft: true,
+            }).ok
+          if (!moved) {
+            next = null
+            break
+          }
+          charged += amount
+          next = charged >= respond.cap ? null : advance(next, respond.minutes * MINUTE, respond)
+        }
+        this.sql.exec("update mentions set next = ?, charged = ? where id = ?", next, charged, row.id)
+        if (row.charged === 0 && charged > 0) warn.push({ ...row, charged })
+      }
+    })
+    this.sql.exec("delete from mentions where at < ?", now - 90 * 24 * 60 * 60 * 1000)
+    await this.arm()
+    // Tell people the first time a tag costs them, so nobody loses coins without knowing why.
+    for (const row of warn) {
+      const link = this.permalink(row)
+      const more =
+        row.charged < respond.cap
+          ? `, and ${respond.amount} more every ${respond.minutes} working minutes, up to ${respond.cap}`
+          : ""
+      await this.call("chat.postMessage", {
+        channel: row.user_id,
+        text: `:hourglass_flowing_sand: <@${row.by_id}> tagged you${link ? ` <${link}|here>` : ""} and is still waiting: that cost you *${currency(config, row.charged)}*${more}. Reply or react to the message to stop it.`,
+        unfurl_links: false,
+      }).catch((error) => console.error("penalty notify failed", error))
+    }
+  }
+
+  /** How quickly each person answers when tagged, over the last 30 days. */
+  async responses(): Promise<Responses> {
+    const rows = this.sql
+      .exec<{ user_id: string; charged: number; answered_at: number | null; took: number | null }>(
+        "select user_id, charged, answered_at, took from mentions where at > ?",
+        Date.now() - 30 * 24 * 60 * 60 * 1000,
+      )
+      .toArray()
+    const byPerson = new Map<string, typeof rows>()
+    for (const row of rows) byPerson.set(row.user_id, [...(byPerson.get(row.user_id) ?? []), row])
+    const people: Responses["people"] = []
+    for (const [id, list] of byPerson) {
+      const account = this.row(id)
+      if (!account || account.gone) continue
+      const times = list.flatMap((row) => (row.answered_at !== null && row.took !== null ? [row.took] : [])).sort((a, b) => a - b)
+      const middle = Math.floor(times.length / 2)
+      people.push({
+        id,
+        name: account.name,
+        image: account.image,
+        tagged: list.length,
+        answered: times.length,
+        waiting: list.length - times.length,
+        median: times.length ? (times.length % 2 ? times[middle]! : Math.round((times[middle - 1]! + times[middle]!) / 2)) : null,
+        lost: list.reduce((sum, row) => sum + row.charged, 0),
+      })
+    }
+    return { people }
   }
 
   private async reaction(event: ReactionEvent) {

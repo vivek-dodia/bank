@@ -9,7 +9,7 @@ import { Tabs } from "@opencode/ui/tabs"
 import { TextInput } from "@opencode/ui/text-input"
 import { createMemo, createResource, createRoot, createSignal, For, type JSX, Match, Show, Switch } from "solid-js"
 import { createStore, reconcile, unwrap } from "solid-js/store"
-import { currency, type Config, type CustomEmoji, type Entry, type History, type Me } from "../shared/types"
+import { currency, type Config, type CustomEmoji, type Entry, type History, type Me, type Responses } from "../shared/types"
 import { api, ApiError, BASE, type Person } from "./api"
 
 export function App() {
@@ -261,6 +261,9 @@ function Dashboard(props: { me: Me; refresh: () => void }) {
             <Tabs.Trigger value="leaderboard">Leaderboard</Tabs.Trigger>
             <Tabs.Trigger value="activity">Activity</Tabs.Trigger>
             <Tabs.Trigger value="give">Give</Tabs.Trigger>
+            <Show when={config().respond.enabled}>
+              <Tabs.Trigger value="responses">Response times</Tabs.Trigger>
+            </Show>
             <Show when={props.me.admin}>
               <Tabs.Trigger value="admin">Admin</Tabs.Trigger>
             </Show>
@@ -276,6 +279,9 @@ function Dashboard(props: { me: Me; refresh: () => void }) {
           </Match>
           <Match when={tab() === "give"}>
             <GiveView me={props.me} done={reload} />
+          </Match>
+          <Match when={tab() === "responses"}>
+            <ResponsesView me={props.me} />
           </Match>
           <Match when={tab() === "admin"}>
             <AdminView me={props.me} changed={reload} />
@@ -378,6 +384,8 @@ function describe(entry: Entry, history: History, viewer: string | null) {
       return entry.to
         ? `${name(entry.actor)} added to ${possessive(entry.to)} balance`
         : `${name(entry.actor)} took from ${possessive(entry.from)} balance`
+    case "penalty":
+      return `${name(entry.from)} took too long to answer ${name(entry.actor)}`
     case "refund":
       return `${name(entry.from)} got back a reaction from ${name(entry.to)}`.replace(/^you got back/, "you returned")
     default:
@@ -448,6 +456,78 @@ function ActivityView(props: { me: Me; history: History | undefined }) {
   return (
     <Panel>
       <ActivityList history={props.history} me={props.me} viewer={props.me.user.id} />
+    </Panel>
+  )
+}
+
+// ---------- response times
+
+function duration(ms: number) {
+  const seconds = Math.round(ms / 1000)
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+function clock(minutes: number) {
+  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`
+}
+
+/** Reads "9", "9:30" or "16:00" as minutes after midnight. */
+function parseClock(text: string) {
+  const match = text.trim().match(/^(\d{1,2})(?::(\d{2}))?$/)
+  if (!match) return null
+  const minutes = Number(match[1]) * 60 + Number(match[2] ?? 0)
+  return Number(match[2] ?? 0) < 60 && minutes <= 24 * 60 ? minutes : null
+}
+
+function ResponsesView(props: { me: Me }) {
+  const [responses] = createResource(() => api.responses())
+  const respond = () => props.me.config.respond
+  // Fastest first; people who haven't answered anything yet go last.
+  const people = createMemo(() =>
+    [...(responses()?.people ?? [])].sort((a, b) => (a.median ?? Infinity) - (b.median ?? Infinity) || b.tagged - a.tagged),
+  )
+  return (
+    <Panel
+      title="Response times"
+      description={
+        <>
+          How long people take to answer when they're tagged in a public channel, over the last 30 days. The clock runs Monday to
+          Friday, {clock(respond().open)} to {clock(respond().close)} ({respond().tz}). After {respond().minutes} minutes without a
+          reply or a reaction it costs {currency(props.me.config, respond().amount)}, and the same again every {respond().minutes}{" "}
+          minutes, up to {respond().cap} a tag.
+        </>
+      }
+    >
+      <div class="border-t divider">
+        <Show when={responses()} fallback={<Empty>Loading…</Empty>}>
+          <Show when={people().length} fallback={<Empty>Nobody has been tagged yet.</Empty>}>
+            <For each={people()}>
+              {(person: Responses["people"][number], index) => (
+                <div class="row flex items-center gap-3 px-4 py-2.5" classList={{ self: person.id === props.me.user.id }}>
+                  <span class="num faint w-6 text-right shrink-0">{index() + 1}</span>
+                  <Avatar src={person.image ?? undefined} fallback={person.name} size="large" />
+                  <div class="flex-1 min-w-0 flex flex-col">
+                    <span class="truncate">{person.name}</span>
+                    <span class="faint truncate">
+                      tagged {person.tagged} {person.tagged === 1 ? "time" : "times"}
+                      <Show when={person.waiting}> · {person.waiting} unanswered</Show>
+                    </span>
+                  </div>
+                  <Show when={person.lost}>
+                    <span class="faint hidden sm:inline">
+                      <Amount me={props.me} value={person.lost} prefix="−" />
+                    </span>
+                  </Show>
+                  <span class="strong num min-w-16 text-right">{person.median === null ? "—" : duration(person.median)}</span>
+                </div>
+              )}
+            </For>
+          </Show>
+        </Show>
+      </div>
     </Panel>
   )
 }
@@ -856,6 +936,95 @@ function SettingsPanel(props: { me: Me; changed: () => void }) {
             onChange={(value: boolean) => setDraft("notify", value)}
             aria-label="Message people when they get a reaction gift"
           />
+        </div>
+
+        <div class="flex flex-col gap-3">
+          <div class="setting">
+            <div class="min-w-0">
+              <div class="strong">Charge for slow replies</div>
+              <div class="muted">
+                When someone is tagged in a public channel and doesn't reply or react in time, they lose {draft.plural}, more the
+                longer they take. Balances can go below zero. Bank has to be reinstalled once to be allowed to see messages.
+              </div>
+            </div>
+            <Toggle
+              checked={draft.respond.enabled}
+              onChange={(value: boolean) => {
+                setDraft("respond", "enabled", value)
+                // Start from the admin's own time zone rather than UTC.
+                if (value && draft.respond.tz === "UTC") setDraft("respond", "tz", Intl.DateTimeFormat().resolvedOptions().timeZone)
+              }}
+              aria-label="Charge people who are slow to answer when tagged"
+            />
+          </div>
+          <Show when={draft.respond.enabled}>
+            <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              <Label text="Time to answer" hint="minutes">
+                <TextInput
+                  class="w-full"
+                  numeric
+                  inputmode="numeric"
+                  value={String(draft.respond.minutes)}
+                  onInput={(event) => setDraft("respond", "minutes", Number(event.currentTarget.value.replace(/[^0-9]/g, "")) || 0)}
+                />
+              </Label>
+              <Label text="Cost each time">
+                <TextInput
+                  class="w-full"
+                  numeric
+                  inputmode="numeric"
+                  value={String(draft.respond.amount)}
+                  onInput={(event) => setDraft("respond", "amount", Number(event.currentTarget.value.replace(/[^0-9]/g, "")) || 0)}
+                />
+              </Label>
+              <Label text="Most per tag">
+                <TextInput
+                  class="w-full"
+                  numeric
+                  inputmode="numeric"
+                  value={String(draft.respond.cap)}
+                  onInput={(event) => setDraft("respond", "cap", Number(event.currentTarget.value.replace(/[^0-9]/g, "")) || 0)}
+                />
+              </Label>
+              <Label text="From" hint="Mon to Fri">
+                <TextInput
+                  class="w-full"
+                  placeholder="09:00"
+                  value={clock(draft.respond.open)}
+                  onBlur={(event: FocusEvent) => {
+                    const input = event.currentTarget as HTMLInputElement
+                    const minutes = parseClock(input.value)
+                    if (minutes !== null) setDraft("respond", "open", minutes)
+                    input.value = clock(draft.respond.open)
+                  }}
+                />
+              </Label>
+              <Label text="Until">
+                <TextInput
+                  class="w-full"
+                  placeholder="16:00"
+                  value={clock(draft.respond.close)}
+                  onBlur={(event: FocusEvent) => {
+                    const input = event.currentTarget as HTMLInputElement
+                    const minutes = parseClock(input.value)
+                    if (minutes !== null) setDraft("respond", "close", minutes)
+                    input.value = clock(draft.respond.close)
+                  }}
+                />
+              </Label>
+              <Label text="Time zone">
+                <TextInput
+                  class="w-full"
+                  placeholder="America/New_York"
+                  value={draft.respond.tz}
+                  onInput={(event) => setDraft("respond", "tz", event.currentTarget.value.trim())}
+                />
+              </Label>
+            </div>
+            <p class="faint m-0">
+              The clock only runs inside these hours. A tag at 3:58pm on Friday isn't late until 9:03am on Monday.
+            </p>
+          </Show>
         </div>
 
         <div class="flex flex-col gap-2">

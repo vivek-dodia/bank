@@ -8,6 +8,8 @@ export const botScopes = [
   "team:read",
   "channels:read",
   "channels:join",
+  // Reads messages in public channels, only to see who was tagged and when they answered.
+  "channels:history",
 ]
 
 export class SlackError extends Error {

@@ -239,6 +239,7 @@ async function api(request: Request, env: Env, path: string) {
   if (route === "GET /leaderboard") return ws.leaderboard()
   if (route === "GET /history") return ws.history(user, "mine")
   if (route === "GET /people") return ws.people(user)
+  if (route === "GET /responses") return ws.responses()
   if (route === "POST /give") {
     const input = await body<{ to: string; amount: number; note?: string }>()
     return ws.give(user, input.to, Number(input.amount), input.note?.trim() || null)

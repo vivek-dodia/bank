@@ -1,5 +1,21 @@
 export type EmojiValue = { name: string; amount: number }
 
+/** Charges people who are slow to answer when someone tags them. Off unless an admin turns it on. */
+export type Respond = {
+  enabled: boolean
+  /** Working minutes someone has to answer a tag, and the wait between each further charge. */
+  minutes: number
+  /** Charged each time the wait runs out. */
+  amount: number
+  /** The most one tag can cost. */
+  cap: number
+  /** Time zone of the working hours, like "America/New_York". */
+  tz: string
+  /** Working hours, Monday to Friday, in minutes after midnight. The clock only runs inside them. */
+  open: number
+  close: number
+}
+
 export type Config = {
   singular: string
   plural: string
@@ -8,6 +24,7 @@ export type Config = {
   starting: number
   emoji: EmojiValue[]
   notify: boolean
+  respond: Respond
 }
 
 export const defaultConfig: Config = {
@@ -22,9 +39,24 @@ export const defaultConfig: Config = {
     { name: "coin-20", amount: 20 },
   ],
   notify: true,
+  respond: { enabled: false, minutes: 5, amount: 5, cap: 50, tz: "UTC", open: 9 * 60, close: 16 * 60 },
 }
 
-export type EntryKind = "grant" | "give" | "reaction" | "refund" | "adjust"
+export type EntryKind = "grant" | "give" | "reaction" | "refund" | "adjust" | "penalty"
+
+/** How quickly each person answers when tagged, over the last 30 days. Times are working time, in milliseconds. */
+export type Responses = {
+  people: {
+    id: string
+    name: string
+    image: string | null
+    tagged: number
+    answered: number
+    waiting: number
+    median: number | null
+    lost: number
+  }[]
+}
 
 export type Entry = {
   id: number

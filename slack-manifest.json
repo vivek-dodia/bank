@@ -44,7 +44,8 @@
         "emoji:read",
         "team:read",
         "channels:read",
-        "channels:join"
+        "channels:join",
+        "channels:history"
       ]
     }
   },
@@ -57,7 +58,8 @@
         "tokens_revoked",
         "team_join",
         "user_change",
-        "channel_created"
+        "channel_created",
+        "message.channels"
       ]
     },
     "org_deploy_enabled": false,

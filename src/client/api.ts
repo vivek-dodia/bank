@@ -1,4 +1,4 @@
-import type { Admin, Config, CustomEmoji, History, Leaderboard, Me } from "../shared/types"
+import type { Admin, Config, CustomEmoji, History, Leaderboard, Me, Responses } from "../shared/types"
 
 export const BASE = "/labs/bank"
 
@@ -30,6 +30,7 @@ export const api = {
   leaderboard: () => request<Leaderboard>("GET", "/leaderboard"),
   history: () => request<History>("GET", "/history"),
   people: () => request<Person[]>("GET", "/people"),
+  responses: () => request<Responses>("GET", "/responses"),
   give: (to: string, amount: number, note: string) => request<{ balance: number }>("POST", "/give", { to, amount, note }),
   allHistory: () => request<History>("GET", "/admin/history"),
   saveConfig: (config: Config) => request<Config>("PUT", "/admin/config", config),
